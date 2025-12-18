@@ -11,7 +11,6 @@ on:
 
 permissions:
   actions: read
-  id-token: write
   contents: read
 
 env:
@@ -79,11 +78,6 @@ jobs:
         command: |
           curl -f http://localhost:9000/minio/health/live || exit 1
 
-    - name: Set up Data Directories
-      run: |
-        mkdir -p ./destination/iceberg/local-test/data/minio-data
-        chmod -R 777 ./destination/iceberg/local-test/data
-
     - name: Install Go Dependencies
       run: go mod download
 
@@ -114,7 +108,7 @@ jobs:
       uses: actions/download-artifact@v4
       continue-on-error: true
       with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
+        github-token: ${{ github.token }}
         run-id: ${{ github.run_id }}
         name: benchmarks_${{ matrix.driver }}
         path: ./drivers/${{ matrix.driver }}/internal/testdata/
