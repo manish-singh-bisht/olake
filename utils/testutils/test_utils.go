@@ -1111,7 +1111,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 				hc.Binds = []string{
 					fmt.Sprintf("%s:/test-olake:rw", cfg.TestConfig.HostRootPath),
 				}
-				hc.ExtraHosts = append(hc.ExtraHosts, "host.docker.internal:host-gateway")
+				hc.ExtraHosts = append(hc.ExtraHosts, "localhost:host-gateway")
 				hc.NetworkMode = "host"
 			},
 			ConfigModifier: func(c *container.Config) {
@@ -1124,12 +1124,21 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 				{
 					PostReadies: []testcontainers.ContainerHook{
 						func(ctx context.Context, c testcontainers.Container) error {
-							if code, output, err := utils.ExecCommand(ctx, c, installCmd); err != nil || code != 0 {
-								return fmt.Errorf("failed to install dependencies:\n%s", string(output))
-							}
+							// Dependencies are pre-installed in the test image, no need to run installCmd
 							t.Logf("(backfill) running performance test for %s", cfg.TestConfig.Driver)
 
 							destDBPrefix := fmt.Sprintf("performance_%s", cfg.TestConfig.Driver)
+
+							// Create performance test tables before discover
+							t.Log("(backfill) creating performance test tables")
+							for _, table := range cfg.BackfillStreams {
+								cfg.ExecuteQuery(ctx, t, []string{table}, "create", false)
+							}
+
+							// Populate backfill tables with moderate amount of data (100k records)
+							t.Log("(backfill) populating performance test tables with data")
+							cfg.ExecuteQuery(ctx, t, cfg.BackfillStreams, "bulk_backfill_data_insert", false)
+							t.Log("(backfill) data population completed")
 
 							t.Log("(backfill) discover started")
 							discoverCmd := discoverCommand(*cfg.TestConfig, "--destination-database-prefix", destDBPrefix)
@@ -1145,7 +1154,7 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 
 							t.Log("(backfill) sync started")
 							usePreChunkedState := cfg.TestConfig.Driver == string(constants.MySQL)
-							syncCmd := syncCommand(*cfg.TestConfig, usePreChunkedState, "iceberg", "--destination-database-prefix", destDBPrefix)
+							syncCmd := syncCommand(*cfg.TestConfig, usePreChunkedState, "parquet", "--destination-database-prefix", destDBPrefix)
 							if output, err := syncWithTimeout(ctx, c, syncCmd); err != nil {
 								return fmt.Errorf("failed to perform sync:\n%s", string(output))
 							}
@@ -1166,8 +1175,14 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 							if len(cfg.CDCStreams) > 0 {
 								t.Logf("(cdc) running performance test for %s", cfg.TestConfig.Driver)
 
+								// Create CDC tables before discover
+								t.Log("(cdc) creating CDC performance test tables")
+								for _, table := range cfg.CDCStreams {
+									cfg.ExecuteQuery(ctx, t, []string{table}, "create", false)
+								}
+
 								t.Log("(cdc) setup cdc started")
-								cfg.ExecuteQuery(ctx, t, cfg.CDCStreams, "setup_cdc", true)
+								cfg.ExecuteQuery(ctx, t, cfg.CDCStreams, "setup_cdc", false)
 								t.Log("(cdc) setup cdc completed")
 
 								t.Log("(cdc) discover started")
@@ -1183,18 +1198,18 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 								}
 
 								t.Log("(cdc) state creation started")
-								syncCmd := syncCommand(*cfg.TestConfig, false, "iceberg", "--destination-database-prefix", destDBPrefix)
+								syncCmd := syncCommand(*cfg.TestConfig, false, "parquet", "--destination-database-prefix", destDBPrefix)
 								if code, output, err := utils.ExecCommand(ctx, c, syncCmd); err != nil || code != 0 {
 									return fmt.Errorf("failed to perform initial sync:\n%s", string(output))
 								}
 								t.Log("(cdc) state creation completed")
 
 								t.Log("(cdc) trigger cdc started")
-								cfg.ExecuteQuery(ctx, t, cfg.CDCStreams, "bulk_cdc_data_insert", true)
+								cfg.ExecuteQuery(ctx, t, cfg.CDCStreams, "bulk_cdc_data_insert", false)
 								t.Log("(cdc) trigger cdc completed")
 
 								t.Log("(cdc) sync started")
-								syncCmd = syncCommand(*cfg.TestConfig, true, "iceberg", "--destination-database-prefix", destDBPrefix)
+								syncCmd = syncCommand(*cfg.TestConfig, true, "parquet", "--destination-database-prefix", destDBPrefix)
 								if output, err := syncWithTimeout(ctx, c, syncCmd); err != nil {
 									return fmt.Errorf("failed to perform CDC sync:\n%s", string(output))
 								}
