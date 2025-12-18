@@ -1,0 +1,134 @@
+name: Performance Tests
+
+on:
+  push:
+    branches:
+    - "staging"
+    paths:
+    - '**/*.go'
+    - '**/*.java'
+  workflow_dispatch:  # Allow manual triggering
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  MYSQL_ROOT_PASSWORD: root1234
+
+jobs:
+  performance-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+        - driver: mysql
+          driver_upper: MYSQL
+        - driver: postgres
+          driver_upper: POSTGRES
+        # TODO: add benchmark tests for the below databases
+        # - driver: mongodb
+        #   driver_upper: MONGODB
+        # - driver: oracle
+        #   driver_upper: ORACLE
+      fail-fast: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.x'
+
+    - name: Set up Java for Maven
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Start Test Infrastructure
+      run: |
+        # Start the database for the current driver
+        docker compose -f ./drivers/${{ matrix.driver }}/docker-compose.yml up -d
+        
+        # Start MinIO for Parquet destination (S3-like storage)
+        docker compose -f ./destination/iceberg/local-test/docker-compose.yml up -d
+
+    - name: Wait for Database
+      uses: nick-fields/retry@v2
+      with:
+        timeout_minutes: 5
+        max_attempts: 30
+        retry_wait_seconds: 5
+        command: |
+          if [ "${{ matrix.driver }}" == "postgres" ]; then
+            docker exec olake_postgres-test psql -h localhost -U postgres -d postgres -c "SELECT 1"
+          elif [ "${{ matrix.driver }}" == "mysql" ]; then
+            docker exec olake_mysql-test mysql -h localhost -u root -p${{ env.MYSQL_ROOT_PASSWORD }} -e "SELECT 1"
+          fi
+
+    - name: Wait for MinIO
+      uses: nick-fields/retry@v2
+      with:
+        timeout_minutes: 2
+        max_attempts: 20
+        retry_wait_seconds: 3
+        command: |
+          curl -f http://localhost:9000/minio/health/live || exit 1
+
+    - name: Install Go Dependencies
+      run: go mod download
+
+    - name: Build Project
+      run: go build -v ./...
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Build Iceberg Sink
+      working-directory: ./destination/iceberg/olake-iceberg-java-writer
+      run: mvn clean package -DskipTests
+
+    - name: Verify Test Data Files
+      run: |
+        echo "Checking test data files..."
+        ls -la ./drivers/${{ matrix.driver }}/internal/testdata/source.json || echo "⚠️ source.json not found"
+        ls -la ./drivers/${{ matrix.driver }}/internal/testdata/parquet_destination.json || echo "⚠️ parquet_destination.json not found"
+        # benchmarks.json will be created if it doesn't exist
+    
+    - name: Download Benchmarks History
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        github-token: ${{ github.token }}
+        run-id: ${{ github.run_id }}
+        name: benchmarks_${{ matrix.driver }}
+        path: ./drivers/${{ matrix.driver }}/internal/testdata/
+    
+    - name: Run Performance Tests
+      run: go test -v ./drivers/${{ matrix.driver }}/internal/... -timeout 0 -run 'Performance'
+    
+    - name: Upload Benchmarks History
+      uses: actions/upload-artifact@v4
+      if: success()
+      continue-on-error: true
+      with:
+        name: benchmarks_${{ matrix.driver }}
+        path: ./drivers/${{ matrix.driver }}/internal/testdata/benchmarks.json
+        retention-days: 90
+   
+    - name: Cleanup
+      if: always()
+      run: |
+        # Stop and remove Docker containers
+        docker compose -f ./drivers/${{ matrix.driver }}/docker-compose.yml down || true
+        docker compose -f ./destination/iceberg/local-test/docker-compose.yml down || true
+        echo "Docker cleanup completed"
